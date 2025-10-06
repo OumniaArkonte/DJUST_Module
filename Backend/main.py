@@ -1,16 +1,18 @@
-import streamlit as st
-import os
-from pathlib import Path
-from datetime import datetime
-import json
-import markdown
-import io
-import sys
-import pandas as pd
-import re
+# =============================
+# main.py - DJUST Order-to-Cash API
+# =============================
 
-# Import ton module Order-to-Cash
+import json
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict, Any
+from fastapi import APIRouter
+
+
+# Import du module principal
 from Modules.Order_to_Cash_Orchestrator import (
+    OrderToCashTeam,
     OrderIntakeAgent,
     InventoryAgent,
     PaymentAgent,
@@ -18,237 +20,191 @@ from Modules.Order_to_Cash_Orchestrator import (
     CoordinatorAgent,
 )
 
-# ----------------------------
-# Page configuration
-# ----------------------------
-st.set_page_config(
-    page_title="Order-to-Cash Module",
-    page_icon="💰",
-    layout="wide",
-    initial_sidebar_state="expanded",
+
+# =============================
+# Initialisation FastAPI
+# =============================
+app = FastAPI(
+    title="DJUST Order-to-Cash Orchestrator API",
+    description="API orchestrant les agents du module Order-to-Cash pour DJUST.",
+    version="1.0.0",
 )
 
-# CSS pour styling
-st.markdown(
-    """
-    <style>
-        .stApp { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); }
-        .chat-header { background: #0f172a; border-radius: 12px; padding: 1.25rem 1.5rem; border: 1px solid #334155; }
-        .chat-message { display: flex; align-items: flex-start; margin-bottom: 1.1rem; }
-        .chat-message.user { flex-direction: row-reverse; }
-        .chat-message .avatar { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1rem; margin: 0 0.75rem; flex-shrink: 0; }
-        .chat-message.user .avatar { background: #0ea5e9; color: #fff; }
-        .chat-message.bot .avatar { background: #0369a1; color: #fff; }
-        .chat-message .content { background: #334155; color: #f1f5f9; padding: 0.85rem 1.1rem; border-radius: 12px; max-width: 72%; border: 1px solid #475569; }
-        .chat-message.user .content { background: #0ea5e9; color: #fff; border-color: #0ea5e9; }
-        .chat-message .timestamp { font-size: 0.72rem; color: #94a3b8; margin-top: 0.35rem; text-align: right; }
-        .chat-message.user .timestamp { color: rgba(255,255,255,.85); }
-    </style>
-    """,
-    unsafe_allow_html=True,
+# Autoriser les requêtes cross-origin (pour interface web ou front-end)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# ----------------------------
-# Session state
-# ----------------------------
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+# =============================
+# Modèles Pydantic pour validation
+# =============================
+class Order(BaseModel):
+    order_id: int
+    customer: str
+    products: List[str]
+    status: str = "NEW"
 
-if "orders" not in st.session_state:
-    st.session_state.orders = []
+class OrderProcessRequest(BaseModel):
+    orders: List[Order]
 
-# ----------------------------
-# Fonctions utilitaires
-# ----------------------------
-def safe_str(obj):
-    if obj is None:
-        return ""
-    elif isinstance(obj, (dict, list)):
-        return json.dumps(obj, indent=2, ensure_ascii=False)
-    return str(obj)
+class PaymentRequest(BaseModel):
+    order_id: int
+    invoice_id: str = None
 
-def display_chat_message(message, is_user=True):
-    message = safe_str(message)
-    html_message = markdown.markdown(message, extensions=['nl2br'])
-    
-    if is_user:
-        st.markdown(
-            f"""
-            <div class="chat-message user">
-                <div class="avatar">RE</div>
-                <div class="content">
-                    {html_message}
-                    <div class="timestamp">just now</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            f"""
-            <div class="chat-message bot">
-                <div class="avatar">AI</div>
-                <div class="content">
-                    {html_message}
-                    <div class="timestamp">AI Team</div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+class ExceptionRequest(BaseModel):
+    order_id: int
+    error: str
 
-def save_uploaded_file(uploaded_file):
-    documents_dir = os.path.join("Modules", "documents")
-    os.makedirs(documents_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{timestamp}_{uploaded_file.name}"
-    file_path = os.path.join(documents_dir, filename)
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return file_path
+# =============================
+# Agents mapping
+# =============================
+AGENT_MAP = {
+    "order_intake": OrderIntakeAgent,
+    "inventory": InventoryAgent,
+    "payment": PaymentAgent,
+    "exception": ExceptionAgent,
+    "coordinator": CoordinatorAgent,
+}
 
-# ----------------------------
-# Capture et affichage propre des agents
-# ----------------------------
-def capture_agent_output(agent, input_data):
-    old_stdout = sys.stdout
-    sys.stdout = mystdout = io.StringIO()
+# =============================
+# Routes API
+# =============================
+
+@app.get("/")
+def home():
+    return {"message": "✅ DJUST Order-to-Cash Orchestrator API is running."}
+
+
+# ---- ORDER INTAKE ----
+@app.post("/api/order/validate")
+def validate_orders(req: OrderProcessRequest):
     try:
-        agent.print_response(input=input_data)
-        output = mystdout.getvalue()
-        if not output.strip():
-            return "(No response from agent)"
-        return output
+        response = OrderIntakeAgent.run(
+            input={"role": "user", "content": json.dumps([order.dict() for order in req.orders])}
+        )
+        return {"agent": "OrderIntakeAgent", "result": response}
     except Exception as e:
-        err_msg = str(e)
-        if "Status 429" in err_msg:
-            return f"⚠️ L'agent {agent.__class__.__name__} n'a pas pu répondre (limite API atteinte)."
-        return f"⚠️ Error from {agent.__class__.__name__}: {err_msg}"
-    finally:
-        sys.stdout = old_stdout
+        raise HTTPException(status_code=500, detail=str(e))
 
-def human_readable_agent_output(output):
-    """
-    Transforme la sortie brute d'un agent en langage naturel lisible.
-    Supprime les Tool Calls et autres détails internes.
-    """
-    
-    output = re.sub(r'(Tool Calls\s+|Message\s+).*', '', output, flags=re.DOTALL)
-    
-    output = re.sub(r'\x1b\[[0-9;]*m', '', output)
-    output = re.sub(r'[^\x20-\x7E\n,{}[\]]+', ' ', output)
 
+# ---- INVENTORY ----
+@app.post("/api/inventory/check")
+def check_inventory(req: OrderProcessRequest):
     try:
-        data = json.loads(output)
-        lines = []
+        product_ids = [sku for order in req.orders for sku in order.products]
+        response = InventoryAgent.run(
+            input={"role": "user", "content": json.dumps({"product_ids": product_ids})}
+        )
+        return {"agent": "InventoryAgent", "result": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    order_id = item.get("order_id", "")
-                    customer = item.get("customer", "")
-                    products = ", ".join(item.get("products", []))
-                    status = item.get("status", "")
-                    lines.append(f"Commande #{order_id} pour {customer} avec produits [{products}] — Statut : {status}")
-                else:
-                    lines.append(str(item))
-        elif isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, list):
-                    v = ", ".join(map(str, v))
-                lines.append(f"{k.capitalize()}: {v}")
-        else:
-            lines.append(str(data))
 
-        return "\n".join(lines)
-    except Exception:
-        return output.strip()
+# ---- PAYMENT ----
+@app.post("/api/payment/process")
+def process_payment(req: PaymentRequest):
+    try:
+        response = PaymentAgent.run(
+            input={"role": "user", "content": json.dumps(req.dict())}
+        )
+        return {"agent": "PaymentAgent", "result": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-def display_agent_output(output, agent_name="Agent"):
-    """
-    Affiche proprement la sortie d'un agent en langage naturel
-    """
-    readable_output = human_readable_agent_output(output)
-    st.markdown(f"### {agent_name}")
-    st.text(readable_output)
 
-# ----------------------------
-# Interface de chat
-# ----------------------------
-st.markdown(
-    f"""
-    <div class="chat-header">
-        <div class="module-tag">💰 Order-to-Cash</div>
-        <h1>Chat with Order-to-Cash Module</h1>
-        <p class="description">Automated order processing workflow</p>
-        <p class="description"><strong>Team:</strong> Order-to-Cash Team</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# ---- EXCEPTION ----
+@app.post("/api/exception/handle")
+def handle_exception(req: ExceptionRequest):
+    try:
+        response = ExceptionAgent.run(
+            input={"role": "user", "content": json.dumps(req.dict())}
+        )
+        return {"agent": "ExceptionAgent", "result": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Historique chat
-for message in st.session_state.chat_history:
-    display_chat_message(message["content"], message["is_user"])
 
-# Message de bienvenue
-if not st.session_state.chat_history:
-    display_chat_message(
-        "Hello! I'm your Order-to-Cash AI assistant. How can I help you today?", 
-        is_user=False
-    )
+# ---- COORDINATOR ----
+@app.post("/api/coordinator/summary")
+def generate_summary(req: OrderProcessRequest):
+    try:
+        product_ids = [sku for order in req.orders for sku in order.products]
+        input_data = {
+            "orders": [order.dict() for order in req.orders],
+            "inventory": {"product_ids": product_ids},
+            "payments": [{"order_id": o.order_id} for o in req.orders],
+            "exceptions": [],
+        }
+        response = CoordinatorAgent.run(input={"role": "user", "content": json.dumps(input_data)})
+        return {"agent": "CoordinatorAgent", "result": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ----------------------------
-# Input utilisateur
-# ----------------------------
-user_input = st.text_area("Your message:", height=80)
-if st.button("Send") and user_input:
-    st.session_state.chat_history.append({"content": user_input, "is_user": True})
-    display_chat_message(user_input, is_user=True)
 
-    # ---- Pipeline agents ----
-    # 1️⃣ Order Intake Agent
-    intake_response = capture_agent_output(OrderIntakeAgent, {"role": "user", "content": user_input})
-    display_agent_output(intake_response, "Order Intake Agent")
-
-    # Stocke les commandes simulées
-    orders = [
-        {"order_id": 1, "customer": "John Doe", "products": ["SKU1", "SKU2"], "status": "NEW"},
-        {"order_id": 2, "customer": "Jane Smith", "products": ["SKU3"], "status": "NEW"},
-    ]
-    st.session_state.orders = orders
-
-    # 2️⃣ Inventory Agent
-    product_ids = [sku for order in orders for sku in order["products"]]
-    inventory_response = capture_agent_output(InventoryAgent, {"role": "user", "content": json.dumps({"product_ids": product_ids})})
-    display_agent_output(inventory_response, "Inventory Agent")
-
-    # 3️⃣ Payment Agent
-    for order in orders:
-        payment_response = capture_agent_output(PaymentAgent, {"role": "user", "content": json.dumps({"order_id": order["order_id"]})})
-        display_agent_output(payment_response, f"Payment Agent - Order {order['order_id']}")
-
-    # 4️⃣ Exception Agent
-    exceptions = [{"order_id": 2, "error": "payment failure"}]
-    for exc in exceptions:
-        exception_response = capture_agent_output(ExceptionAgent, {"role": "user", "content": json.dumps(exc)})
-        display_agent_output(exception_response, f"Exception Agent - Order {exc['order_id']}")
-
-    # 5️⃣ Coordinator Agent
-    coordinator_input = {
-        "orders": orders,
-        "inventory": {"product_ids": product_ids},
-        "payments": [{"order_id": order["order_id"]} for order in orders],
-        "exceptions": exceptions,
+# ---- TEAM ----
+@app.get("/team/info")
+def get_team_info():
+    """Retourne la configuration complète de l’équipe Order-to-Cash."""
+    return {
+        "team_name": OrderToCashTeam.name,
+        "description": OrderToCashTeam.description,
+        "members": [member.name for member in OrderToCashTeam.members],
     }
-    coordinator_response = capture_agent_output(CoordinatorAgent, {"role": "user", "content": json.dumps(coordinator_input)})
-    display_agent_output(coordinator_response, "Coordinator Agent")
 
-# ----------------------------
-# Upload de fichiers
-# ----------------------------
-uploaded_file = st.file_uploader("Upload a document")
-if uploaded_file:
-    file_path = save_uploaded_file(uploaded_file)
-    st.success(f"File saved to: {file_path}")
+
+@app.post("/team/query")
+def query_team(message: Dict[str, str]):
+    """Envoie une requête à l’équipe complète (multi-agents)."""
+    try:
+        user_message = message.get("message", "")
+        result = OrderToCashTeam.run(input={"role": "user", "content": user_message})
+        return {"team": OrderToCashTeam.name, "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+router = APIRouter(prefix="/api", tags=["Dashboard"])
+
+@router.get("/dashboard/summary")
+def get_summary():
+    return {
+        "total_orders": 120,
+        "active_inventory": 8,
+        "payments_total": 35700,
+        "active_exceptions": 3,
+        "exceptions_today": 1,
+    }
+
+@router.get("/order/all")
+def get_orders():
+    return [
+        {"order_id": 101, "customer": "Alice", "total": 1200, "status": "validated"},
+        {"order_id": 102, "customer": "Bob", "total": 800, "status": "pending"},
+        {"order_id": 103, "customer": "Charlie", "total": 950, "status": "failed"},
+        {"order_id": 104, "customer": "David", "total": 1350, "status": "validated"},
+    ]
+
+@router.get("/exceptions/active")
+def get_exceptions():
+    return [
+        {"order_id": 103, "type": "Payment", "error": "Card declined", "status": "active"},
+        {"order_id": 110, "type": "Inventory", "error": "Out of stock", "status": "active"},
+        {"order_id": 120, "type": "Billing", "error": "Invoice mismatch", "status": "resolved"},
+    ]
+
+
+
+
+
+# =============================
+# Lancement
+# =============================
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting DJUST Order-to-Cash API...")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
